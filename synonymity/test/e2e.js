@@ -1,29 +1,39 @@
-// End-to-end test with a mocked Datamuse API.
+// End-to-end test. Serves the game with a fixture in place of data/lists.js.
 // Run: node synonymity/test/e2e.js   (needs Playwright + Chromium)
 const { chromium } = require("playwright");
 const path = require("path");
+const http = require("http");
+const fs = require("fs");
 const assert = require("assert");
 
-const PAGE = "file://" + path.resolve(__dirname, "../index.html");
-const SYN = [
-  { word: "glad", tags: ["f:40"] },
-  { word: "jubilant", tags: ["f:0.8"] },
-  { word: "blithe", tags: ["f:0.05"] },
-  { word: "cheery", tags: ["f:2"] },
+const ROOT = path.resolve(__dirname, "..");
+const answers = [
+  { w: "blithe", o: 6.3, k: "e" },
+  { w: "jubilant", o: 5.1, k: "e" },
+  { w: "devour", o: 4.6, k: "e" },
+  { w: "glad", o: 3.4, k: "e" },
+  { w: "content", o: 3.22, k: "c" },
 ];
-const ML = [{ word: "content", tags: ["f:60"] }, { word: "glad", tags: ["f:40"] }];
+const PROMPTS = ["happy", "sad", "eat", "angry", "big", "small", "fast", "slow", "brave", "calm"];
+const FIXTURE = {
+  version: 1,
+  lists: Object.fromEntries(PROMPTS.map((p) => [p, { gloss: `adj. test sense of ${p}`, answers }])),
+};
 
-async function mock(page) {
-  await page.route("https://api.datamuse.com/**", (r) => {
-    const u = new URL(r.request().url());
-    let body = [];
-    if (u.searchParams.get("rel_syn")) body = SYN;
-    else if (u.searchParams.get("ml")) body = ML;
-    else if (u.searchParams.get("sp")) {
-      const w = u.searchParams.get("sp");
-      body = w === "zzqx" ? [] : [{ word: w }];
-    }
-    r.fulfill({ contentType: "application/json", headers: { "access-control-allow-origin": "*" }, body: JSON.stringify(body) });
+// Serves index.html from disk and the fixture in place of data/lists.js.
+function serve() {
+  return new Promise((resolve) => {
+    const srv = http.createServer((req, res) => {
+      const url = req.url.split("?")[0];
+      if (url === "/data/lists.js") {
+        res.setHeader("content-type", "text/javascript");
+        return res.end(`window.SYNONYMITY_LISTS = ${JSON.stringify(FIXTURE)};`);
+      }
+      if (url !== "/" && url !== "/index.html") { res.statusCode = 404; return res.end(); }
+      res.setHeader("content-type", "text/html");
+      fs.createReadStream(path.join(ROOT, "index.html")).pipe(res);
+    });
+    srv.listen(0, "127.0.0.1", () => resolve(srv));
   });
 }
 
@@ -36,13 +46,12 @@ async function guess(p, w) {
 }
 
 (async () => {
+  const srv = await serve();
   const browser = await chromium.launch();
-  const ctx = await browser.newContext();
-  const p = await ctx.newPage();
+  const p = await (await browser.newContext()).newPage();
   const errors = [];
   p.on("pageerror", (e) => errors.push(e.message));
-  await mock(p);
-  await p.goto(PAGE);
+  await p.goto(`http://127.0.0.1:${srv.address().port}/`);
 
   // Scoring parity with roborean obscurity_of_fpm
   const obs = await p.evaluate(() => [40, 0.05, 0, 1e-9].map(__synonymity.obscurityOfFpm));
@@ -51,19 +60,19 @@ async function guess(p, w) {
   assert.strictEqual(obs[2], 11); // floored at 1e-6 fpm
   assert.strictEqual(obs[3], 11);
 
-  // Daily is deterministic for a date
-  const same = await p.evaluate(() => {
-    const a = __synonymity.pickWords(__synonymity.mulberry32(__synonymity.seedFrom("2026-01-01")));
-    const b = __synonymity.pickWords(__synonymity.mulberry32(__synonymity.seedFrom("2026-01-01")));
-    return a.join() === b.join() && new Set(a).size === 7;
+  // Daily is deterministic for a date and drawn from the lists
+  const daily = await p.evaluate(() => {
+    const pick = () => __synonymity.pickWords(__synonymity.mulberry32(__synonymity.seedFrom("2026-01-01")));
+    const a = pick(), b = pick();
+    return { same: a.join() === b.join(), unique: new Set(a).size, inPool: a.every((w) => __synonymity.POOL.includes(w)) };
   });
-  assert.ok(same, "daily words deterministic and unique");
+  assert.deepStrictEqual(daily, { same: true, unique: 7, inPool: true });
 
   await ready(p);
   const prompt = (await p.textContent(".prompt")).trim();
-  assert.match(await guess(p, "zzqx"), /isn't in the dictionary/);
+  assert.match(await p.textContent(".gloss"), new RegExp(`test sense of ${prompt}`));
   assert.match(await guess(p, prompt), /same word/);
-  assert.match(await guess(p, "table"), /doesn't count/);
+  assert.match(await guess(p, "table"), /isn't on the list/);
   assert.match(await p.textContent("#tries"), /2 tries/);
   assert.match(await guess(p, "blithe"), /accepted/);
   assert.match(await p.textContent("#after"), /\+63/);
@@ -75,11 +84,11 @@ async function guess(p, w) {
   }
   await p.click("#next");
   const summary = await p.textContent("#stage");
-  assert.match(summary, /213 points/);
+  assert.match(summary, /213 points/); // 63 + 3×16 (close, half) + 3×34
   assert.match(summary, /Played/);
   assert.match(summary, /Next daily in/);
 
-  // Reload restores finished daily and doesn't double-count stats
+  // Reload restores the finished daily and doesn't double-count stats
   await p.reload();
   await p.waitForSelector(".prompt");
   assert.match(await p.textContent(".prompt"), /213 points/);
@@ -87,8 +96,14 @@ async function guess(p, w) {
   assert.strictEqual(st.played, 1);
   assert.strictEqual(st.best, 213);
 
-  // Practice round: out of tries
+  // Inflected guesses match the base form on the list
   await p.click("#again");
+  await ready(p);
+  assert.match(await guess(p, "devoured"), /accepted/);
+  assert.match(await p.textContent("#after"), /\+46/);
+
+  // Out of tries
+  await p.click("#next");
   await ready(p);
   for (const w of ["table", "chair", "lamp"]) await guess(p, w);
   assert.match(await p.textContent("#msg"), /Out of tries/);
@@ -100,5 +115,6 @@ async function guess(p, w) {
   }
   assert.deepStrictEqual(errors, []);
   await browser.close();
+  srv.close();
   console.log("all e2e checks passed");
 })().catch((e) => { console.error(e); process.exit(1); });

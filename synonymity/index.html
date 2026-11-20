@@ -41,6 +41,7 @@
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 20px; }
   .label { color: var(--muted); font-size: .8rem; text-transform: uppercase; letter-spacing: .08em; }
   .prompt { font-size: 2.2rem; font-weight: 700; margin: 4px 0 16px; word-break: break-word; }
+  .gloss { color: var(--muted); font-style: italic; margin: -12px 0 16px; }
   form { display: flex; gap: 8px; }
   input[type=text] {
     flex: 1; min-width: 0; font: inherit; padding: 10px 12px; border-radius: 10px;
@@ -89,14 +90,15 @@
   <section class="card" id="stage"></section>
   <details>
     <summary>How scoring works</summary>
-    <p>Each accepted synonym is scored by <em>obscurity</em>, the same formula as Roborean:
-      <code>8 − log10(frequency per billion words)</code>, using Datamuse frequency data.
-      Common words score about 2–3 and rare ones 6 or more. Points are obscurity × 10.</p>
-    <p>A true synonym (Datamuse <code>rel_syn</code>) gets full points. A close-in-meaning word
-      (<code>ml</code>) gets half. You get 3 tries per word. Real words that don't match don't use up a try.
-      Answering with the prompt word or one of its forms isn't allowed.</p>
+    <p>Each word has a curated answer list. Claude drafts a broad list of acceptable synonyms
+      (common, literary, archaic, slang), and Datamuse supplies how often each one appears in English.</p>
+    <p>Answers are scored by <em>obscurity</em>, the same formula as Roborean:
+      <code>8 − log10(frequency per billion words)</code>. Common words score about 2–3 and rare ones 6 or more.
+      Points are obscurity × 10. An exact synonym gets full points and a close-in-meaning one gets half.</p>
+    <p>You get 3 tries per word. Answering with the prompt word or one of its forms isn't allowed.</p>
   </details>
 </main>
+<script src="data/lists.js"></script>
 <script>
 (() => {
   "use strict";
@@ -109,25 +111,12 @@
   }
   const round1 = (x) => Math.round(x * 10) / 10;
 
-  // ---- Prompt pool ----
-  const POOL = [
-    "happy","sad","angry","big","small","fast","slow","smart","stupid","brave",
-    "afraid","tired","strong","weak","rich","poor","beautiful","ugly","old","new",
-    "cold","hot","wet","dry","loud","quiet","bright","dark","clean","dirty",
-    "easy","hard","funny","serious","strange","calm","busy","lazy","kind","cruel",
-    "honest","lie","walk","run","eat","talk","look","think","help","break",
-    "fight","steal","laugh","cry","sleep","jump","throw","build","destroy","hide",
-    "begin","end","grow","shrink","praise","insult","gather","scatter","wander","hurry",
-    "rubbish","nonsense","friend","enemy","house","journey","mistake","problem","idea","anger",
-    "joy","fear","courage","wealth","noise","crowd","fight","speech","trick","danger",
-    "delicious","tiny","huge","odd","proud","shy","greedy","clever","boring","fancy",
-    "messy","shiny","sturdy","fragile","gloomy","cheerful","stubborn","sneaky","vague","obvious",
-    "abundant","scarce","eager","reluctant","famous","hungry","drunk","crazy","nervous","rude"
-  ].filter((w, i, a) => a.indexOf(w) === i);
+  // ---- Prompt pool: curated lists from data/lists.js (tools/build-lists.mjs) ----
+  const LISTS = (window.SYNONYMITY_LISTS && window.SYNONYMITY_LISTS.lists) || {};
+  const POOL = Object.keys(LISTS).sort();
 
   const ROUND_LEN = 7;
   const TRIES = 3;
-  const API = "https://api.datamuse.com/words";
 
   // ---- Deterministic daily selection ----
   function mulberry32(seed) {
@@ -162,46 +151,28 @@
     set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
   };
 
-  // ---- Datamuse ----
+  // ---- Answer lists ----
+  // answers: Map word -> { word, obs, kind: "syn" | "near" }
   const cache = new Map();
-  function freqOf(entry) {
-    const tag = (entry.tags || []).find((t) => t.startsWith("f:"));
-    return tag ? parseFloat(tag.slice(2)) : null;
-  }
-  async function getJson(url) {
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return res.json();
-  }
-  async function loadPrompt(word) {
-    if (cache.has(word)) return cache.get(word);
-    const p = (async () => {
-      const [syn, ml] = await Promise.all([
-        getJson(`${API}?rel_syn=${encodeURIComponent(word)}&md=f&max=1000`),
-        getJson(`${API}?ml=${encodeURIComponent(word)}&md=f&max=150`),
-      ]);
-      const answers = new Map(); // word -> {word, fpm, kind}
-      for (const e of syn) {
-        if (!isSingleWord(e.word)) continue;
-        answers.set(e.word.toLowerCase(), { word: e.word.toLowerCase(), fpm: freqOf(e), kind: "syn" });
+  function loadPrompt(word) {
+    if (!cache.has(word)) {
+      const list = LISTS[word];
+      const answers = new Map();
+      if (list) for (const a of list.answers) {
+        if (!sameRoot(a.w, word)) answers.set(a.w, { word: a.w, obs: a.o, kind: a.k === "e" ? "syn" : "near" });
       }
-      for (const e of ml) {
-        const w = e.word.toLowerCase();
-        if (!isSingleWord(w) || answers.has(w)) continue;
-        answers.set(w, { word: w, fpm: freqOf(e), kind: "near" });
-      }
-      for (const [w] of answers) if (sameRoot(w, word)) answers.delete(w);
-      return answers;
-    })();
-    cache.set(word, p);
-    p.catch(() => cache.delete(word));
-    return p;
+      cache.set(word, answers);
+    }
+    return Promise.resolve(cache.get(word));
   }
-  async function isRealWord(word) {
-    try {
-      const r = await getJson(`${API}?sp=${encodeURIComponent(word)}&max=1`);
-      return r.length > 0 && r[0].word.toLowerCase() === word;
-    } catch { return true; }
+  // Accept simple inflections of listed words: "devours" -> "devour", "hurried" -> "hurry".
+  function lookup(answers, guess) {
+    const forms = [guess];
+    const add = (re, rep) => { if (re.test(guess)) forms.push(guess.replace(re, rep)); };
+    add(/ies$/, "y"); add(/ied$/, "y"); add(/es$/, ""); add(/s$/, ""); add(/ed$/, ""); add(/ed$/, "e"); add(/d$/, "");
+    add(/ing$/, ""); add(/ing$/, "e"); add(/([b-df-hj-np-tv-z])\1(ed|ing)$/, "$1"); add(/ier$/, "y"); add(/iest$/, "y");
+    for (const f of forms) if (answers.has(f)) return answers.get(f);
+    return null;
   }
   const isSingleWord = (w) => /^[a-z][a-z'-]*$/i.test(w);
   function sameRoot(a, b) {
@@ -212,7 +183,7 @@
     return sa.length >= 3 && sa === sb;
   }
   function pointsFor(entry) {
-    const obs = round1(obscurityOfFpm(entry.fpm));
+    const obs = round1(entry.obs);
     const mult = entry.kind === "syn" ? 1 : 0.5;
     return { obs, points: Math.round(obs * 10 * mult) };
   }
@@ -224,9 +195,14 @@
 
   function newGame(mode) {
     const key = todayKey();
+    if (POOL.length < ROUND_LEN) {
+      $("stage").innerHTML = `<div class="label">No word lists yet</div>
+        <p>Build them with <code>node tools/build-lists.mjs</code> (see the README).</p>`;
+      return;
+    }
     if (mode === "daily") {
       const saved = store.get("synonymity:daily");
-      if (saved && saved.date === key) { state = saved; render(); return; }
+      if (saved && saved.date === key && saved.words.every((w) => w in LISTS)) { state = saved; render(); return; }
       state = { mode, date: key, words: pickWords(mulberry32(seedFrom(key))), i: 0, tries: TRIES, results: [] };
     } else {
       state = { mode, date: key, words: pickWords(Math.random), i: 0, tries: TRIES, results: [] };
@@ -254,6 +230,7 @@
     $("stage").innerHTML = `
       <div class="label">Word ${state.i + 1} of ${state.words.length}</div>
       <div class="prompt">${esc(word)}</div>
+      ${LISTS[word] && LISTS[word].gloss ? `<div class="gloss">${esc(LISTS[word].gloss)}</div>` : ""}
       <form id="f" autocomplete="off">
         <input id="guess" type="text" placeholder="Type a synonym…" aria-label="Your synonym" ${answered ? "disabled" : ""}>
         <button class="primary" id="go" ${answered ? "disabled" : ""}>Submit</button>
@@ -268,10 +245,6 @@
       if (answers.size === 0) { $("msg").textContent = "No synonyms found for this one. Skipping it."; return finish(null, answers); }
       if (answered) { $("msg").textContent = ""; showAfter(answered, answers); }
       else { $("msg").textContent = ""; input.focus(); }
-    }).catch(() => {
-      $("msg").className = "msg bad";
-      $("msg").innerHTML = `Couldn't reach the Datamuse API. <button type="button" id="retry">Retry</button>`;
-      $("retry").onclick = render;
     });
   }
 
@@ -287,19 +260,15 @@
     busy = true; $("go").disabled = true;
     try {
       const answers = await loadPrompt(word);
-      const hit = answers.get(guess);
-      if (hit) return finish(guess, answers);
-      if (!(await isRealWord(guess))) {
-        msg.className = "msg bad"; msg.textContent = `"${guess}" isn't in the dictionary. That one's free.`;
-        return;
-      }
+      const hit = lookup(answers, guess);
+      if (hit) return finish(hit.word, answers);
       state.tries -= 1; save();
       $("tries").textContent = `${state.tries} ${state.tries === 1 ? "try" : "tries"} left`;
       if (state.tries <= 0) return finish(null, answers, guess);
-      msg.className = "msg bad"; msg.textContent = `"${guess}" doesn't count as a synonym of "${word}".`;
+      msg.className = "msg bad"; msg.textContent = `"${guess}" isn't on the list for "${word}".`;
       $("guess").select();
     } catch {
-      msg.className = "msg bad"; msg.textContent = "Network error. Try again.";
+      msg.className = "msg bad"; msg.textContent = "Something went wrong. Try again.";
     } finally {
       busy = false; const g = $("go"); if (g && !state.results[state.i]) g.disabled = false;
     }
