@@ -7,6 +7,8 @@ A daily word game: you get seven prompt words and give a synonym for each. Rarer
 - **After each word**, the game shows the rarest and most common synonyms with their obscurity, and how your answer ranks.
 - **Modes:** *Daily* uses the same words for everyone, seeded by the date, and saves progress in localStorage. *Practice* picks random words.
 
+Run the tests with `node synonymity/test/e2e.js` (Playwright + Chromium; Datamuse is mocked).
+
 It's a single static file that calls the Datamuse API (no key, CORS-enabled) from the browser. Open `index.html` directly or serve the folder:
 
 ```bash
